@@ -1,0 +1,198 @@
+name: Check the Apple silicon app
+
+# Starts the Apple silicon installer of a release on one of GitHub's Apple silicon Macs: downloads it as a
+# visitor would, checks its fingerprint and what macOS says about its signature, starts it, and looks at the
+# window it shows. Run by hand after a release is made: Actions, this workflow, Run workflow.
+#
+# The app is started with MARCUS_DESKTOP_TEST=1 and a data folder of its own, as its own tests start it: it
+# then touches no keychain and opens nothing outside itself. Nobody signs in; the window it shows is the
+# Marcus service's sign-in page.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version of the release to check"
+        required: true
+        default: "0.0.1"
+      sha256:
+        description: "The SHA-256 its Apple silicon disk image must have"
+        required: true
+        default: "55fc7ef330fe1d5d55f4a5813a2c67f8e8f5566013413fd5595e8a4cb618d325"
+
+permissions:
+  contents: read
+
+jobs:
+  apple-silicon:
+    name: Start Marcus on Apple silicon
+    runs-on: macos-latest
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ inputs.version }}
+      EXPECTED_SHA256: ${{ inputs.sha256 }}
+    steps:
+      - name: This Mac
+        run: |
+          sw_vers
+          echo "processor: $(uname -m), $(sysctl -n machdep.cpu.brand_string)"
+          test "$(uname -m)" = "arm64"
+
+      - name: Download the disk image, as a visitor would
+        run: |
+          curl --fail --location --silent --show-error --retry 3 --output "$RUNNER_TEMP/Marcus.dmg" "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/Marcus-$VERSION-mac-arm64.dmg"
+          ls -l "$RUNNER_TEMP/Marcus.dmg"
+          actual="$(shasum -a 256 "$RUNNER_TEMP/Marcus.dmg" | cut -d' ' -f1)"
+          echo "SHA-256: $actual"
+          test "$actual" = "$EXPECTED_SHA256"
+
+      - name: Open it and copy Marcus to Applications
+        run: |
+          hdiutil attach -nobrowse -readonly -mountpoint "$RUNNER_TEMP/image" "$RUNNER_TEMP/Marcus.dmg"
+          ls -la "$RUNNER_TEMP/image"
+          ditto "$RUNNER_TEMP/image/Marcus.app" /Applications/Marcus.app
+          hdiutil detach "$RUNNER_TEMP/image"
+          # As a browser marks what it downloads, so that macOS judges this copy as it would a visitor's.
+          xattr -r -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;" /Applications/Marcus.app
+          xattr -p com.apple.quarantine /Applications/Marcus.app
+
+      - name: What macOS says about the app
+        run: |
+          echo "built for: $(lipo -archs /Applications/Marcus.app/Contents/MacOS/Marcus)"
+          test "$(lipo -archs /Applications/Marcus.app/Contents/MacOS/Marcus)" = "arm64"
+          codesign --verify --deep --strict /Applications/Marcus.app
+          echo "signature: verifies, every part"
+          codesign -dvv /Applications/Marcus.app 2>&1 | grep -E "^(Identifier|Authority|TeamIdentifier|Timestamp|CodeDirectory)"
+          codesign -dvv /Applications/Marcus.app 2>&1 | grep -q "^Authority=Developer ID Application: TKJ GLOBAL MEDIA LTD (665CS52N48)$"
+          xcrun stapler validate /Applications/Marcus.app
+          spctl -a -t exec -vv /Applications/Marcus.app 2>&1 | tee "$RUNNER_TEMP/gatekeeper.txt"
+          grep -q "source=Notarized Developer ID" "$RUNNER_TEMP/gatekeeper.txt"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Start Marcus and look at its window
+        run: |
+          cat > "$RUNNER_TEMP/look.mjs" <<'EOF'
+          // Asks the running app, through Chromium's debugging port (as the app's own tests do), what its window shows.
+          import fs from "node:fs";
+          const port = 9333;
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          async function until(read, ms) {
+            const end = Date.now() + ms;
+            for (;;) {
+              const value = await read().catch(() => null);
+              if (value) return value;
+              if (Date.now() > end) return null;
+              await sleep(500);
+            }
+          }
+          const version = await until(async () => (await fetch(`http://127.0.0.1:${port}/json/version`)).json(), 60000);
+          if (!version) {
+            console.log("Marcus did not start.");
+            process.exit(1);
+          }
+          console.log("the app answers:", version.Browser);
+          const list = async () => (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+          const page = await until(async () => (await list()).find((entry) => entry.type === "page" && entry.url.startsWith("https://marcus.tkjglobalmedia.com/")), 60000);
+          if (!page) {
+            console.log("No window is showing the Marcus service. Windows:", JSON.stringify((await list().catch(() => [])).map((entry) => ({ type: entry.type, url: entry.url, title: entry.title }))));
+            process.exit(1);
+          }
+          const socket = new WebSocket(page.webSocketDebuggerUrl);
+          await new Promise((resolve, reject) => {
+            socket.onopen = resolve;
+            socket.onerror = reject;
+          });
+          let last = 0;
+          const waiting = new Map();
+          socket.onmessage = (event) => {
+            const message = JSON.parse(event.data);
+            if (message.id && waiting.has(message.id)) {
+              waiting.get(message.id)(message);
+              waiting.delete(message.id);
+            }
+          };
+          const send = (method, params = {}) =>
+            new Promise((resolve) => {
+              const id = ++last;
+              waiting.set(id, resolve);
+              socket.send(JSON.stringify({ id, method, params }));
+            });
+          const expression = `JSON.stringify({
+            address: location.origin + location.pathname,
+            title: document.title,
+            heading: document.querySelector("h1")?.textContent.trim() ?? null,
+            emailField: !!document.querySelector("#sign-in-email"),
+            button: [...document.querySelectorAll("button")].map((b) => b.textContent.trim()).find((t) => /sign-in link/i.test(t)) ?? null,
+            loaded: document.readyState,
+            app: window.marcusDesktop ? { platform: window.marcusDesktop.platform, appVersion: window.marcusDesktop.appVersion, mode: window.marcusDesktop.mode } : null,
+          })`;
+          const seen = await until(async () => {
+            const answer = await send("Runtime.evaluate", { expression, returnByValue: true });
+            const value = JSON.parse(answer.result.result.value);
+            return value.loaded === "complete" && value.emailField ? value : null;
+          }, 60000);
+          const picture = await send("Page.captureScreenshot", { format: "png" });
+          if (picture.result?.data) fs.writeFileSync(`${process.env.RUNNER_TEMP}/marcus-window.png`, Buffer.from(picture.result.data, "base64"));
+          socket.close();
+          if (!seen) {
+            console.log("The window did not show the sign-in page in time. It shows:", page.url, page.title);
+            process.exit(1);
+          }
+          console.log("the window shows:", JSON.stringify(seen, null, 2));
+          const wrong = [];
+          if (seen.address !== "https://marcus.tkjglobalmedia.com/sign-in") wrong.push(`the address is ${seen.address}`);
+          if (!seen.app) wrong.push("the page was not told it is inside the Marcus app");
+          else {
+            if (seen.app.platform !== "darwin") wrong.push(`the app says its platform is ${seen.app.platform}`);
+            if (seen.app.appVersion !== process.env.VERSION) wrong.push(`the app says it is version ${seen.app.appVersion}`);
+            if (seen.app.mode !== "hosted") wrong.push(`the app says its mode is ${seen.app.mode}`);
+          }
+          if (wrong.length) {
+            console.log("Wrong:", wrong.join("; "));
+            process.exit(1);
+          }
+          console.log("Marcus started on Apple silicon and shows the sign-in page.");
+          EOF
+          export MARCUS_DESKTOP_TEST=1 MARCUS_DESKTOP_USER_DATA="$RUNNER_TEMP/marcus-data"
+          /Applications/Marcus.app/Contents/MacOS/Marcus --remote-debugging-port=9333 > "$RUNNER_TEMP/marcus-output.txt" 2>&1 &
+          echo $! > "$RUNNER_TEMP/marcus.pid"
+          node "$RUNNER_TEMP/look.mjs"
+
+      - name: The app's own log, and whether it is still running
+        if: always()
+        run: |
+          echo "--- processes"
+          pgrep -fl "/Applications/Marcus.app" || true
+          echo "--- the app's log"
+          cat "$RUNNER_TEMP/marcus-data/logs/main.log" || true
+          echo "--- what it printed"
+          cat "$RUNNER_TEMP/marcus-output.txt" || true
+          kill -0 "$(cat "$RUNNER_TEMP/marcus.pid")"
+          grep -q "Marcus $VERSION starting (hosted mode" "$RUNNER_TEMP/marcus-data/logs/main.log"
+          grep -q "darwin arm64)" "$RUNNER_TEMP/marcus-data/logs/main.log"
+
+      - name: Quit Marcus
+        if: always()
+        run: |
+          pid="$(cat "$RUNNER_TEMP/marcus.pid" 2>/dev/null || true)"
+          if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid"
+            for second in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+            if kill -0 "$pid" 2>/dev/null; then echo "Marcus did not quit when asked"; kill -9 "$pid"; exit 1; fi
+            echo "Marcus quit when asked."
+          fi
+
+      - name: Keep the picture of the window and the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marcus-apple-silicon
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/marcus-window.png
+            ${{ runner.temp }}/marcus-data/logs/main.log
+            ${{ runner.temp }}/marcus-output.txt
+            ${{ runner.temp }}/gatekeeper.txt
